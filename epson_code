@@ -1,0 +1,264 @@
+'EPSON SIDE CODE
+'epson controller ip: 192.168.0.1
+'		subnet mask: 255.255.252.0
+'		IP gateway: 0.0.0.0
+'
+'have to disable DHCP and set this IP for Modbus on the Windows side:
+'windows machine ip: 192.168.0.15
+'		subnet mask: 255.255.252.0
+'		default gateway: 10.8.4.1
+'
+'------------------------------------------------------
+' Lacey Bowden, modified from Gary Banks
+' For use with python machine vision program, main.py in Bowden_Robot_Final directory on the Desktop
+' local 1 is conveyor origin, local 2 is large pallet origin, local 3 is small pallet origin
+' 	x,y values sent from Python are scaled by 100 then converted back here (hence the /100) since Modbus only sends whole ints.
+'
+'
+' start EPSON program first, wait for it to home and say it is waiting for Python. Ensure all pallets are empty before starting Python code.
+' both programs end when either 5 faulty (orange) products are palletized or when 15 good (white) products are palletized.
+'
+' helpful Register values to remember:
+' in 'All Outputs' bits:
+'	"Conveyor" is on pin 9, N/O conveyor relay
+'   "Gripper" is on pin 10, N/O gripper relay
+'   "cycle_done" is bit 512(also visible in 'Fieldbus Slave Outputs' bit monitor), tells Python script when the robot is done with a cycle
+' in 'Fieldbus Slave Inputs' bit:
+'   "cycle_complete" in bit 512 is unused... replaced with the "cycle_done" above b/c the Python Modbus side reads from the Fieldbus Slave Outputs
+'   			although python reads the next one just fine... may be worth looking into?
+'   "robot_start" is bit 513, how the Python script checks if the robot cycle is done
+'   "conveyor_on" is bit 514, how the Python side tells the Epson side to turn on/off the conveyor for detecting bottles
+' in "All Inputs" word:
+' 	"num_bottles", word 100 is where Python sets the number of reachable good items
+'		x values are in the odd places starting with word 33
+'       y values are in the even places starting with word 34
+' 	"num_bottles_bad", word 130 is where Python sets the number of reachable good items
+'		x values are in the odd places starting with word 101
+'       y values are in the even places starting with word 102
+'
+'------------------------------------------------------
+
+'----------
+' Main code, automatically called by the robot on program start
+'	sets all necessary settings/variables, initializes movement settings, loops and calls Main1() until end condition is met
+'	executes Modbus_To_Output(), which runs in the background controlling I/O (conveyor in this case)
+'   turns off motors, makes robot safe when program ends
+'----------
+Function main
+	Off cycle_done 'make sure python script can't send stuff yet
+	Cls
+	Reset
+	Motor On
+	Integer total_good_items, total_bad_items, limit_good, limit_bad
+	total_good_items = 0
+	limit_good = 15 'limit 15 (bc of pallet)
+	total_bad_items = 0
+	limit_bad = 5 'limit 5 (bc of pallet)
+	Off Conveyor
+	Off Gripper
+	Xqt Modbus_to_Output 'turns on/off conveyor in the background
+	On cycle_done
+	
+	
+	P(1) = XY(-25, 250, 0, 0) 'Home
+	Power High
+	Integer sp, acc
+	sp = 80
+	acc = 65
+	Speed sp 'g_fast
+	Accel acc, acc 'g_accfast, g_accfast
+	SpeedS sp 'g_fasts
+	AccelS acc, acc 'g_accfasts, g_accfasts
+
+	Do While ((total_good_items < limit_good) And (total_bad_items < limit_bad))
+
+		Print total_good_items, " good items, ", total_bad_items, " bad items"
+
+		Jump P(1) 'Home
+		'P(2) = XY(-300, 100, -20, 0)
+		'Jump P(2)
+
+		Call Main1(ByRef total_good_items, ByRef total_bad_items, limit_good, limit_bad)
+		Jump P(1) 'Home
+		On cycle_done
+	Loop
+	
+	Wait 0.2
+	Power Low
+	Motor Off
+	Cls
+	Print "Status: Finished!"
+	Print total_good_items, " good items, ", total_bad_items, " bad items"
+Fend
+'----------
+' Main1, called by main
+'   increments total_good_items and total_bad_items as necessary
+'	waits for new reachable Python coordinates, halts background I/O control during pick and place
+'	iterates through good (white) items, placing them in the big pallet then
+'   iterates through bad (orange) items, placing them in the small pallet
+'   resumes background I/O control
+'----------
+Function Main1(ByRef total_good_items As Integer, ByRef total_bad_items As Integer, limit_good As Integer, limit_bad As Integer)
+	Print("Waiting for Python to send coords...")
+	Wait Sw(robot_start)
+	Print("Got something!")
+	Off cycle_done
+	Halt Modbus_to_Output
+	Integer i, num_good, num_bad
+	Real TargetX, TargetY, scale
+	scale = 100.0
+	
+	'Palletize GOOD items
+	num_good = InW(num_bottles)
+	If num_good > 0 Then
+		For i = 0 To (num_good - 1)
+			Print "Good bottle ", i
+			TargetX = InW(33 + 2 * i)
+			TargetX = TargetX / scale
+			
+			TargetY = InW(34 + 2 * i)
+			TargetY = TargetY / scale
+			
+			
+			'Debugging
+			'Print "Coord Number ", i
+	  		'Print "TargetX = ", TargetX
+	  		'Print "TargetY = ", TargetY
+	  	 	If total_good_items < limit_good Then Call Pick_and_Place(TargetX, TargetY, total_good_items, True) Else Print "Good pallet is full!"
+	  		total_good_items = total_good_items + 1
+		Next
+	EndIf
+	
+	'Palletize BAD items
+	num_bad = InW(num_bottles_bad)
+	If num_bad > 0 Then
+		For i = 0 To (num_bad - 1)
+			Print "Bad bottle ", i
+			TargetX = InW(101 + 2 * i)
+			TargetX = TargetX / scale
+			
+			TargetY = InW(102 + 2 * i)
+			TargetY = TargetY / scale
+			
+			'Debugging
+			'Print "Coord Number ", i
+	  		'Print "TargetX = ", TargetX
+	  		'Print "TargetY = ", TargetY
+	  	 	If total_bad_items < limit_bad Then Call Pick_and_Place(TargetX, TargetY, total_bad_items, False) Else Print "Bad pallet is full!"
+	  		total_bad_items = total_bad_items + 1
+		Next
+	EndIf
+	Resume Modbus_to_Output
+	
+Fend
+'----------
+' Pick_and_Place(), called by Main1()
+'	picks item number n from x,y coords, places in either the good pallet or the bad one as indicated by variable 'good'
+'----------
+Function Pick_and_Place(x As Real, y As Real, n As Integer, good As Boolean)
+	'SMALL PALLET START: 499.438, 292.318, -22.584
+	'for testing, go to the x, y, z loc and stop
+	Real z_conveyor, above_z_conveyor, z_table, z_top
+	'z_conveyor = -147.0 'made frame where this is 0 now
+	above_z_conveyor = 147.7
+	z_top = 0.0
+	z_table = -10.0
+	
+	Print "Picking..."
+	'Go 
+	P(2) = XY(x, y, above_z_conveyor, 0) /L /1   'At "local coordinate frame" 1 ... -147 actual z value
+	Jump P(2)
+	P(2) = XY(x, y, -2, 0) /L /1
+	Jump P(2)
+	On Gripper
+	P(2) = XY(x, y, above_z_conveyor, 0) /L /1
+	Jump P(2)
+	If good Then Call Place(n) Else Call Place_bad(n)
+Fend
+'----------
+' Place(), called by Pick_and_Place()
+'	palletizes GOOD item number n in appropriate spot, which is already picked up when this function is called
+'----------
+Function Place(item_no As Integer)
+	Real x_place, y_place, safe_z
+	Integer num_cols, num_rows, idx, row, col, remainder
+	idx = item_no
+	num_cols = 3
+	num_rows = 5
+	safe_z = 13.4
+	Real cell_sz
+	cell_sz = -50.8
+	
+	' remainder = idx Mod num_cols
+	row = num_rows - 1 - (idx / num_cols)
+	col = idx Mod num_cols
+	
+	x_place = col * cell_sz
+	y_place = row * cell_sz
+	Print "GOOD row: ", row, " col: ", col
+	
+	'Print "Placing good item..." ', x_place, " ", y_place
+
+	P(2) = XY(x_place, y_place, safe_z, 0) /L /2
+	Jump P(2)
+	P(2) = XY(x_place, y_place, 0, 0) /L /2
+	Jump P(2)
+	Off Gripper
+	Wait .1
+	P(2) = XY(x_place, y_place, safe_z, 0) /L /2
+	Jump P(2)
+Fend
+'----------
+' Place_bad(), called by Pick_and_Place()
+'	palletizes BAD item number n in appropriate spot, which is already picked up when this function is called
+'----------
+Function Place_bad(item_no As Integer)
+	Real x_place, y_place, safe_z, safe_y
+	Integer num_cols, num_rows, idx, row, col, remainder
+	idx = item_no
+	num_cols = 1
+	num_rows = 5
+	safe_z = 13.4
+	Real cell_sz
+	cell_sz = -50.8
+	
+	' remainder = idx Mod num_cols
+	row = num_rows - 1 - (idx / num_cols)
+	col = idx Mod num_cols
+	
+	x_place = col * cell_sz
+	y_place = row * cell_sz
+	Print "BAD row: ", row, " col: ", col
+	Go XY(0, 0, safe_z, 0) /L /3 'first go in front so i don't hit other pallet
+	
+	'Print "Placing bad item..." ', x_place, " ", y_place
+
+	P(2) = XY(x_place, y_place, safe_z, 0) /L /3
+	Jump P(2)
+	P(2) = XY(x_place, y_place, 0, 0) /L /3
+	Jump P(2)
+	Off Gripper
+	Wait .1
+	P(2) = XY(x_place, y_place, safe_z, 0) /L /3
+	Jump P(2)
+	P(2) = XY(x_place, safe_y, safe_z, 0) /L /3 'end in front so i don't hit other pallet
+	Jump P(2)
+Fend
+'----------
+' Modbus_to_Output(), runs in the background but halted during Pick and Place operations
+'	constantly checks the 'conveyor_on' variable set by Python, controls conveyor accordingly.
+'----------
+Function Modbus_to_Output
+	Do
+		'Horizontal Conveyor Modbus_IN->Hardware_Out
+		If Sw(conveyor_on) = On Then
+			'Print "Conveyor ON"
+			On Conveyor
+		Else
+			'Print "Conveyor OFF"
+			Off Conveyor
+		EndIf
+
+		Wait 0.025
+	Loop
+Fend
